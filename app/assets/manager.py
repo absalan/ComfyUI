@@ -8,6 +8,7 @@ from app.assets.database.queries import (
     asset_exists_by_hash,
     fetch_asset_info_asset_and_tags,
     fetch_asset_info_and_asset,
+    touch_asset_info_by_id,
     list_cache_states_by_asset_id,
     list_asset_infos_page,
     list_tags_with_usage,
