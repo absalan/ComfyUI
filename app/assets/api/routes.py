@@ -29,6 +29,18 @@ def _validation_error_response(code: str, ve: ValidationError) -> web.Response:
     return _error_response(400, code, "Validation failed.", {"errors": ve.json()})
 
 
+@ROUTES.head("/api/assets/hash/{hash}")
+async def head_asset_by_hash(request: web.Request) -> web.Response:
+    hash_str = request.match_info.get("hash", "").strip().lower()
+    if not hash_str or ":" not in hash_str:
+        return _error_response(400, "INVALID_HASH", "hash must be like 'blake3:<hex>'")
+    algo, digest = hash_str.split(":", 1)
+    if algo != "blake3" or not digest or any(c for c in digest if c not in "0123456789abcdef"):
+        return _error_response(400, "INVALID_HASH", "hash must be like 'blake3:<hex>'")
+    exists = manager.asset_exists(asset_hash=hash_str)
+    return web.Response(status=200 if exists else 404)
+
+
 @ROUTES.get("/api/assets")
 async def list_assets(request: web.Request) -> web.Response:
     """

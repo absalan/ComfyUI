@@ -25,7 +25,10 @@ def _safe_sort_field(requested: str | None) -> str:
     return "created_at"
 
 
-def asset_exists(asset_hash: str) -> bool:
+def asset_exists(*, asset_hash: str) -> bool:
+    """
+    Check if an asset with a given hash exists in database.
+    """
     with create_session() as session:
         return asset_exists_by_hash(session, asset_hash=asset_hash)
 
