@@ -222,7 +222,10 @@ class VideoSlice(io.ComfyNode):
 
     @classmethod
     def execute(cls, video, start_time, duration) -> io.NodeOutput:
-        return io.NodeOutput(video.as_trimmed(start_time, duration))
+        trimmed = video.as_trimmed(start_time, duration)
+        if trimmed is not None:
+            return io.NodeOutput(trimmed)
+        raise ValueError(f"Failed to slice video:\nSource duration: {video.get_duration()}\nStart time: {start_time}\nTarget duration: {duration}")
 
 
 class VideoExtension(ComfyExtension):
