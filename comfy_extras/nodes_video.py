@@ -208,12 +208,30 @@ class VideoSlice(io.ComfyNode):
         return io.Schema(
             node_id="Video Slice",
             display_name="Video Slice",
-            search_aliases=["trim video duration", "skip first frames", "frame load cap", "start time"],
+            search_aliases=[
+                "trim video duration",
+                "skip first frames",
+                "frame load cap",
+                "start time",
+            ],
             category="image/video",
             inputs=[
-                io.Video.Input('video'),
-                io.Float.Input('start_time', default=0.0, min=0.0, step=.001),
-                io.Float.Input('duration', default=0.0, min=0.0, step=.001),
+                io.Video.Input("video"),
+                io.Float.Input(
+                    "start_time",
+                    default=0.0,
+                    max=1e5,
+                    min=0.0,
+                    step=0.001,
+                    tooltip="Start time in seconds",
+                ),
+                io.Float.Input(
+                    "duration",
+                    default=0.0,
+                    min=0.0,
+                    step=0.001,
+                    tooltip="Duration in seconds",
+                ),
             ],
             outputs=[
                 io.Video.Output(),
@@ -225,7 +243,9 @@ class VideoSlice(io.ComfyNode):
         trimmed = video.as_trimmed(start_time, duration)
         if trimmed is not None:
             return io.NodeOutput(trimmed)
-        raise ValueError(f"Failed to slice video:\nSource duration: {video.get_duration()}\nStart time: {start_time}\nTarget duration: {duration}")
+        raise ValueError(
+            f"Failed to slice video:\nSource duration: {video.get_duration()}\nStart time: {start_time}\nTarget duration: {duration}"
+        )
 
 
 class VideoExtension(ComfyExtension):
