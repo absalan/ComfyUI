@@ -39,11 +39,11 @@ precision highp float;
 uniform sampler2D u_image0;
 uniform vec2 u_resolution;
 
-in vec2 v_texcoord;
+in vec2 v_texCoord;
 layout(location = 0) out vec4 fragColor0;
 
 void main() {
-    fragColor0 = texture(u_image0, v_texcoord);
+    fragColor0 = texture(u_image0, v_texCoord);
 }
 """
 
@@ -54,11 +54,11 @@ VERTEX_SHADER = """#version 330
 in vec2 in_position;
 in vec2 in_texcoord;
 
-out vec2 v_texcoord;
+out vec2 v_texCoord;
 
 void main() {
     gl_Position = vec4(in_position, 0.0, 1.0);
-    v_texcoord = in_texcoord;
+    v_texCoord = in_texcoord;
 }
 """
 
