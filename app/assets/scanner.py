@@ -107,11 +107,12 @@ def _prune_orphaned_assets(roots: tuple[RootType, ...]) -> int:
     if not all_prefixes:
         return 0
 
-    prefix_conds = [
-        AssetCacheState.file_path.like(escaped + "%", escape=esc)
-        for p in all_prefixes
-        for escaped, esc in [escape_like_prefix(p if p.endswith(os.sep) else p + os.sep)]
-    ]
+    def make_prefix_condition(prefix: str):
+        base = prefix if prefix.endswith(os.sep) else prefix + os.sep
+        escaped, esc = escape_like_prefix(base)
+        return AssetCacheState.file_path.like(escaped + "%", escape=esc)
+
+    matches_valid_prefix = sqlalchemy.or_(*[make_prefix_condition(p) for p in all_prefixes])
 
     orphan_subq = (
         sqlalchemy.select(Asset.id)
@@ -120,7 +121,7 @@ def _prune_orphaned_assets(roots: tuple[RootType, ...]) -> int:
     ).scalar_subquery()
 
     with create_session() as sess:
-        sess.execute(sqlalchemy.delete(AssetCacheState).where(sqlalchemy.not_(sqlalchemy.or_(*prefix_conds))))
+        sess.execute(sqlalchemy.delete(AssetCacheState).where(~matches_valid_prefix))
         sess.execute(sqlalchemy.delete(AssetInfo).where(AssetInfo.asset_id.in_(orphan_subq)))
         result = sess.execute(sqlalchemy.delete(Asset).where(Asset.id.in_(orphan_subq)))
         sess.commit()
