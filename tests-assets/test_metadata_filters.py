@@ -1,7 +1,5 @@
 import json
 
-import pytest
-
 
 def test_meta_and_across_keys_and_types(
     http, api_base: str, asset_factory, make_asset_bytes

@@ -1,7 +1,6 @@
 import json
 import uuid
 
-import pytest
 import requests
 
 

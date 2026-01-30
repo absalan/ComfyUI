@@ -2,7 +2,6 @@ import time
 import uuid
 
 import requests
-import pytest
 
 
 def test_list_assets_paging_and_sort(http: requests.Session, api_base: str, asset_factory, make_asset_bytes):
