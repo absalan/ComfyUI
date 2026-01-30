@@ -35,7 +35,12 @@ class VideoInput(ABC):
         pass
 
     @abstractmethod
-    def as_trimmed(self, start_time: float|None=None, duration: float|None=None) -> VideoInput|None:
+    def as_trimmed(
+        self,
+        start_time: float | None = None,
+        duration: float | None = None,
+        strict_duration: bool = False,
+    ) -> VideoInput | None:
         """
         Create a new VideoInput which is trimmed to have the corresponding start_time and duration
 

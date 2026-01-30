@@ -221,7 +221,7 @@ class VideoSlice(io.ComfyNode):
                     "start_time",
                     default=0.0,
                     max=1e5,
-                    min=0.0,
+                    min=-1e5,
                     step=0.001,
                     tooltip="Start time in seconds",
                 ),
@@ -230,7 +230,7 @@ class VideoSlice(io.ComfyNode):
                     default=0.0,
                     min=0.0,
                     step=0.001,
-                    tooltip="Duration in seconds",
+                    tooltip="Duration in seconds, or 0 for unlimited duration",
                 ),
             ],
             outputs=[
@@ -240,7 +240,7 @@ class VideoSlice(io.ComfyNode):
 
     @classmethod
     def execute(cls, video, start_time, duration) -> io.NodeOutput:
-        trimmed = video.as_trimmed(start_time, duration)
+        trimmed = video.as_trimmed(start_time, duration, strict_duration=False)
         if trimmed is not None:
             return io.NodeOutput(trimmed)
         raise ValueError(
