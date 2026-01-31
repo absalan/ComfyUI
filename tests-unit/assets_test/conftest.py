@@ -98,7 +98,7 @@ def comfy_url_and_proc(comfy_tmp_base_dir: Path, request: pytest.FixtureRequest)
     out_log = open(logs_dir / "stdout.log", "w", buffering=1)
     err_log = open(logs_dir / "stderr.log", "w", buffering=1)
 
-    comfy_root = Path(__file__).resolve().parent.parent
+    comfy_root = Path(__file__).resolve().parent.parent.parent
     if not (comfy_root / "main.py").is_file():
         raise FileNotFoundError(f"main.py not found under {comfy_root}")
 
