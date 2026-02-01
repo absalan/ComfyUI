@@ -14,9 +14,13 @@ Usage:
 """
 
 import json
+import logging
 import sys
 import re
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
 
 GLSL_DIR = Path(__file__).parent
 BLUEPRINTS_DIR = GLSL_DIR.parent
@@ -42,7 +46,7 @@ def extract_shaders():
             with open(json_path, 'r') as f:
                 data = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
-            print(f"  Skipping {json_path.name}: {e}")
+            logger.warning("Skipping %s: %s", json_path.name, e)
             continue
 
         # Find GLSLShader nodes in subgraphs
@@ -62,11 +66,11 @@ def extract_shaders():
                             with open(frag_path, 'w') as f:
                                 f.write(widget)
 
-                            print(f"  Extracted: {frag_name}")
+                            logger.info("  Extracted: %s", frag_name)
                             extracted += 1
                             break
 
-    print(f"\nExtracted {extracted} shader(s)")
+    logger.info("\nExtracted %d shader(s)", extracted)
 
 
 def patch_shaders():
@@ -78,7 +82,7 @@ def patch_shaders():
         # Parse filename: {blueprint_name}_{node_id}.frag
         parts = frag_path.stem.rsplit('_', 1)
         if len(parts) != 2:
-            print(f"  Skipping {frag_path.name}: invalid filename format")
+            logger.warning("Skipping %s: invalid filename format", frag_path.name)
             continue
 
         blueprint_name, node_id_str = parts
@@ -86,7 +90,7 @@ def patch_shaders():
         try:
             node_id = int(node_id_str)
         except ValueError:
-            print(f"  Skipping {frag_path.name}: invalid node_id")
+            logger.warning("Skipping %s: invalid node_id", frag_path.name)
             continue
 
         with open(frag_path, 'r') as f:
@@ -108,7 +112,7 @@ def patch_shaders():
             with open(json_path, 'r') as f:
                 data = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
-            print(f"  Error reading {json_path.name}: {e}")
+            logger.error("Error reading %s: %s", json_path.name, e)
             continue
 
         modified = False
@@ -121,7 +125,7 @@ def patch_shaders():
                         if len(widgets) > 0 and widgets[0] != shader_code:
                             widgets[0] = shader_code
                             modified = True
-                            print(f"  Patched: {json_path.name} (node {node_id})")
+                            logger.info("  Patched: %s (node %d)", json_path.name, node_id)
                             patched += 1
 
         if modified:
@@ -129,9 +133,9 @@ def patch_shaders():
                 json.dump(data, f)
 
     if patched == 0:
-        print("No changes to apply.")
+        logger.info("No changes to apply.")
     else:
-        print(f"\nPatched {patched} shader(s)")
+        logger.info("\nPatched %d shader(s)", patched)
 
 
 def main():
@@ -141,13 +145,13 @@ def main():
         command = sys.argv[1].lower()
 
     if command == "extract":
-        print("Extracting shaders from blueprints...")
+        logger.info("Extracting shaders from blueprints...")
         extract_shaders()
     elif command in ("patch", "update", "apply"):
-        print("Patching shaders into blueprints...")
+        logger.info("Patching shaders into blueprints...")
         patch_shaders()
     else:
-        print(__doc__)
+        logger.info(__doc__)
         sys.exit(1)
 
 
