@@ -12,7 +12,7 @@ import mimetypes
 import contextlib
 from typing import Sequence
 
-import app.assets.hashing as hashing
+import app.assets.services.hashing as hashing
 from app.database.db import create_session
 from app.assets.api import schemas_out, schemas_in
 from app.assets.database.queries import (
