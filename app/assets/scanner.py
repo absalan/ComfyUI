@@ -1,19 +1,22 @@
-import contextlib
 import time
 import logging
 import os
-import sqlalchemy
 
 import folder_paths
 from app.database.db import create_session, dependencies_available
 from app.assets.helpers import (
     collect_models_files, compute_relative_filename, fast_asset_file_check, get_name_and_tags_from_asset_path,
-    list_tree,prefixes_for_root, escape_like_prefix,
+    list_tree, prefixes_for_root, escape_like_prefix,
     RootType
 )
-from app.assets.database.tags import add_missing_tag_for_asset_id, ensure_tags_exist, remove_missing_tag_for_asset_id
+from app.assets.database.queries import (
+    add_missing_tag_for_asset_id,
+    ensure_tags_exist,
+    remove_missing_tag_for_asset_id,
+    prune_orphaned_assets,
+    fast_db_consistency_pass,
+)
 from app.assets.database.bulk_ops import seed_from_paths_batch
-from app.assets.database.models import Asset, AssetCacheState, AssetInfo
 
 
 def seed_assets(roots: tuple[RootType, ...], enable_logging: bool = False) -> None:
@@ -33,14 +36,28 @@ def seed_assets(roots: tuple[RootType, ...], enable_logging: bool = False) -> No
         existing_paths: set[str] = set()
         for r in roots:
             try:
-                survivors: set[str] = _fast_db_consistency_pass(r, collect_existing_paths=True, update_missing_tags=True)
+                with create_session() as sess:
+                    survivors: set[str] = fast_db_consistency_pass(
+                        sess,
+                        r,
+                        prefixes_for_root_fn=prefixes_for_root,
+                        escape_like_prefix_fn=escape_like_prefix,
+                        fast_asset_file_check_fn=fast_asset_file_check,
+                        add_missing_tag_fn=add_missing_tag_for_asset_id,
+                        remove_missing_tag_fn=remove_missing_tag_for_asset_id,
+                        collect_existing_paths=True,
+                        update_missing_tags=True,
+                    )
+                    sess.commit()
                 if survivors:
                     existing_paths.update(survivors)
             except Exception as e:
                 logging.exception("fast DB scan failed for %s: %s", r, e)
 
         try:
-            orphans_pruned = _prune_orphaned_assets(roots)
+            with create_session() as sess:
+                orphans_pruned = prune_orphaned_assets(sess, roots, prefixes_for_root)
+                sess.commit()
         except Exception as e:
             logging.exception("orphan pruning failed: %s", e)
 
@@ -101,163 +118,4 @@ def seed_assets(roots: tuple[RootType, ...], enable_logging: bool = False) -> No
             )
 
 
-def _prune_orphaned_assets(roots: tuple[RootType, ...]) -> int:
-    """Prune cache states outside configured prefixes, then delete orphaned seed assets."""
-    all_prefixes = [os.path.abspath(p) for r in roots for p in prefixes_for_root(r)]
-    if not all_prefixes:
-        return 0
 
-    def make_prefix_condition(prefix: str):
-        base = prefix if prefix.endswith(os.sep) else prefix + os.sep
-        escaped, esc = escape_like_prefix(base)
-        return AssetCacheState.file_path.like(escaped + "%", escape=esc)
-
-    matches_valid_prefix = sqlalchemy.or_(*[make_prefix_condition(p) for p in all_prefixes])
-
-    orphan_subq = (
-        sqlalchemy.select(Asset.id)
-        .outerjoin(AssetCacheState, AssetCacheState.asset_id == Asset.id)
-        .where(Asset.hash.is_(None), AssetCacheState.id.is_(None))
-    ).scalar_subquery()
-
-    with create_session() as sess:
-        sess.execute(sqlalchemy.delete(AssetCacheState).where(~matches_valid_prefix))
-        sess.execute(sqlalchemy.delete(AssetInfo).where(AssetInfo.asset_id.in_(orphan_subq)))
-        result = sess.execute(sqlalchemy.delete(Asset).where(Asset.id.in_(orphan_subq)))
-        sess.commit()
-        return result.rowcount
-
-
-def _fast_db_consistency_pass(
-    root: RootType,
-    *,
-    collect_existing_paths: bool = False,
-    update_missing_tags: bool = False,
-) -> set[str] | None:
-    """Fast DB+FS pass for a root:
-      - Toggle needs_verify per state using fast check
-      - For hashed assets with at least one fast-ok state in this root: delete stale missing states
-      - For seed assets with all states missing: delete Asset and its AssetInfos
-      - Optionally add/remove 'missing' tags based on fast-ok in this root
-      - Optionally return surviving absolute paths
-    """
-    prefixes = prefixes_for_root(root)
-    if not prefixes:
-        return set() if collect_existing_paths else None
-
-    conds = []
-    for p in prefixes:
-        base = os.path.abspath(p)
-        if not base.endswith(os.sep):
-            base += os.sep
-        escaped, esc = escape_like_prefix(base)
-        conds.append(AssetCacheState.file_path.like(escaped + "%", escape=esc))
-
-    with create_session() as sess:
-        rows = (
-            sess.execute(
-                sqlalchemy.select(
-                    AssetCacheState.id,
-                    AssetCacheState.file_path,
-                    AssetCacheState.mtime_ns,
-                    AssetCacheState.needs_verify,
-                    AssetCacheState.asset_id,
-                    Asset.hash,
-                    Asset.size_bytes,
-                )
-                .join(Asset, Asset.id == AssetCacheState.asset_id)
-                .where(sqlalchemy.or_(*conds))
-                .order_by(AssetCacheState.asset_id.asc(), AssetCacheState.id.asc())
-            )
-        ).all()
-
-        by_asset: dict[str, dict] = {}
-        for sid, fp, mtime_db, needs_verify, aid, a_hash, a_size in rows:
-            acc = by_asset.get(aid)
-            if acc is None:
-                acc = {"hash": a_hash, "size_db": int(a_size or 0), "states": []}
-                by_asset[aid] = acc
-
-            fast_ok = False
-            try:
-                exists = True
-                fast_ok = fast_asset_file_check(
-                    mtime_db=mtime_db,
-                    size_db=acc["size_db"],
-                    stat_result=os.stat(fp, follow_symlinks=True),
-                )
-            except FileNotFoundError:
-                exists = False
-            except OSError:
-                exists = False
-
-            acc["states"].append({
-                "sid": sid,
-                "fp": fp,
-                "exists": exists,
-                "fast_ok": fast_ok,
-                "needs_verify": bool(needs_verify),
-            })
-
-        to_set_verify: list[int] = []
-        to_clear_verify: list[int] = []
-        stale_state_ids: list[int] = []
-        survivors: set[str] = set()
-
-        for aid, acc in by_asset.items():
-            a_hash = acc["hash"]
-            states = acc["states"]
-            any_fast_ok = any(s["fast_ok"] for s in states)
-            all_missing = all(not s["exists"] for s in states)
-
-            for s in states:
-                if not s["exists"]:
-                    continue
-                if s["fast_ok"] and s["needs_verify"]:
-                    to_clear_verify.append(s["sid"])
-                if not s["fast_ok"] and not s["needs_verify"]:
-                    to_set_verify.append(s["sid"])
-
-            if a_hash is None:
-                if states and all_missing:  # remove seed Asset completely, if no valid AssetCache exists
-                    sess.execute(sqlalchemy.delete(AssetInfo).where(AssetInfo.asset_id == aid))
-                    asset = sess.get(Asset, aid)
-                    if asset:
-                        sess.delete(asset)
-                else:
-                    for s in states:
-                        if s["exists"]:
-                            survivors.add(os.path.abspath(s["fp"]))
-                continue
-
-            if any_fast_ok:  # if Asset has at least one valid AssetCache record, remove any invalid AssetCache records
-                for s in states:
-                    if not s["exists"]:
-                        stale_state_ids.append(s["sid"])
-                if update_missing_tags:
-                    with contextlib.suppress(Exception):
-                        remove_missing_tag_for_asset_id(sess, asset_id=aid)
-            elif update_missing_tags:
-                with contextlib.suppress(Exception):
-                    add_missing_tag_for_asset_id(sess, asset_id=aid, origin="automatic")
-
-            for s in states:
-                if s["exists"]:
-                    survivors.add(os.path.abspath(s["fp"]))
-
-        if stale_state_ids:
-            sess.execute(sqlalchemy.delete(AssetCacheState).where(AssetCacheState.id.in_(stale_state_ids)))
-        if to_set_verify:
-            sess.execute(
-                sqlalchemy.update(AssetCacheState)
-                .where(AssetCacheState.id.in_(to_set_verify))
-                .values(needs_verify=True)
-            )
-        if to_clear_verify:
-            sess.execute(
-                sqlalchemy.update(AssetCacheState)
-                .where(AssetCacheState.id.in_(to_clear_verify))
-                .values(needs_verify=False)
-            )
-        sess.commit()
-        return survivors if collect_existing_paths else None

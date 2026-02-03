@@ -1,21 +1,27 @@
 import os
 import logging
-import sqlalchemy as sa
 from collections import defaultdict
 from datetime import datetime
-from typing import Iterable, Any
-from sqlalchemy import select, delete, exists, func
+from typing import Any, Sequence
+
+import sqlalchemy as sa
+from sqlalchemy import select, delete, exists
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, noload
-from app.assets.database.models import Asset, AssetInfo, AssetCacheState, AssetInfoMeta, AssetInfoTag, Tag
+
+from app.assets.database.models import (
+    Asset, AssetInfo, AssetCacheState, AssetInfoMeta, AssetInfoTag, Tag
+)
 from app.assets.helpers import (
     compute_relative_filename, escape_like_prefix, normalize_tags, project_kv, utcnow
 )
-from typing import Sequence
+from app.assets.database.queries.asset import get_asset_by_hash
+from app.assets.database.queries.cache_state import list_cache_states_by_asset_id, pick_best_live_path
+from app.assets.database.queries.tags import ensure_tags_exist, set_asset_info_tags, remove_missing_tag_for_asset_id
 
 
-def visible_owner_clause(owner_id: str) -> sa.sql.ClauseElement:
+def _visible_owner_clause(owner_id: str) -> sa.sql.ClauseElement:
     """Build owner visibility predicate for reads. Owner-less rows are visible to everyone."""
     owner_id = (owner_id or "").strip()
     if owner_id == "":
@@ -23,23 +29,7 @@ def visible_owner_clause(owner_id: str) -> sa.sql.ClauseElement:
     return AssetInfo.owner_id.in_(["", owner_id])
 
 
-def pick_best_live_path(states: Sequence[AssetCacheState]) -> str:
-    """
-    Return the best on-disk path among cache states:
-      1) Prefer a path that exists with needs_verify == False (already verified).
-      2) Otherwise, pick the first path that exists.
-      3) Otherwise return empty string.
-    """
-    alive = [s for s in states if getattr(s, "file_path", None) and os.path.isfile(s.file_path)]
-    if not alive:
-        return ""
-    for s in alive:
-        if not getattr(s, "needs_verify", False):
-            return s.file_path
-    return alive[0].file_path
-
-
-def apply_tag_filters(
+def _apply_tag_filters(
     stmt: sa.sql.Select,
     include_tags: Sequence[str] | None = None,
     exclude_tags: Sequence[str] | None = None,
@@ -67,7 +57,7 @@ def apply_tag_filters(
     return stmt
 
 
-def apply_metadata_filter(
+def _apply_metadata_filter(
     stmt: sa.sql.Select,
     metadata_filter: dict | None = None,
 ) -> sa.sql.Select:
@@ -119,22 +109,6 @@ def apply_metadata_filter(
     return stmt
 
 
-def asset_exists_by_hash(
-    session: Session,
-    *,
-    asset_hash: str,
-) -> bool:
-    """
-    Check if an asset with a given hash exists in database.
-    """
-    row = (
-        session.execute(
-            select(sa.literal(True)).select_from(Asset).where(Asset.hash == asset_hash).limit(1)
-        )
-    ).first()
-    return row is not None
-
-
 def asset_info_exists_for_asset_id(
     session: Session,
     *,
@@ -147,16 +121,6 @@ def asset_info_exists_for_asset_id(
         .limit(1)
     )
     return (session.execute(q)).first() is not None
-
-
-def get_asset_by_hash(
-    session: Session,
-    *,
-    asset_hash: str,
-) -> Asset | None:
-    return (
-        session.execute(select(Asset).where(Asset.hash == asset_hash).limit(1))
-    ).scalars().first()
 
 
 def get_asset_info_by_id(
@@ -183,15 +147,15 @@ def list_asset_infos_page(
         select(AssetInfo)
         .join(Asset, Asset.id == AssetInfo.asset_id)
         .options(contains_eager(AssetInfo.asset), noload(AssetInfo.tags))
-        .where(visible_owner_clause(owner_id))
+        .where(_visible_owner_clause(owner_id))
     )
 
     if name_contains:
         escaped, esc = escape_like_prefix(name_contains)
         base = base.where(AssetInfo.name.ilike(f"%{escaped}%", escape=esc))
 
-    base = apply_tag_filters(base, include_tags, exclude_tags)
-    base = apply_metadata_filter(base, metadata_filter)
+    base = _apply_tag_filters(base, include_tags, exclude_tags)
+    base = _apply_metadata_filter(base, metadata_filter)
 
     sort = (sort or "created_at").lower()
     order = (order or "desc").lower()
@@ -211,13 +175,13 @@ def list_asset_infos_page(
         select(sa.func.count())
         .select_from(AssetInfo)
         .join(Asset, Asset.id == AssetInfo.asset_id)
-        .where(visible_owner_clause(owner_id))
+        .where(_visible_owner_clause(owner_id))
     )
     if name_contains:
         escaped, esc = escape_like_prefix(name_contains)
         count_stmt = count_stmt.where(AssetInfo.name.ilike(f"%{escaped}%", escape=esc))
-    count_stmt = apply_tag_filters(count_stmt, include_tags, exclude_tags)
-    count_stmt = apply_metadata_filter(count_stmt, metadata_filter)
+    count_stmt = _apply_tag_filters(count_stmt, include_tags, exclude_tags)
+    count_stmt = _apply_metadata_filter(count_stmt, metadata_filter)
 
     total = int((session.execute(count_stmt)).scalar_one() or 0)
 
@@ -250,7 +214,7 @@ def fetch_asset_info_asset_and_tags(
         .join(Tag, Tag.name == AssetInfoTag.tag_name, isouter=True)
         .where(
             AssetInfo.id == asset_info_id,
-            visible_owner_clause(owner_id),
+            _visible_owner_clause(owner_id),
         )
         .options(noload(AssetInfo.tags))
         .order_by(Tag.name.asc())
@@ -281,7 +245,7 @@ def fetch_asset_info_and_asset(
         .join(Asset, Asset.id == AssetInfo.asset_id)
         .where(
             AssetInfo.id == asset_info_id,
-            visible_owner_clause(owner_id),
+            _visible_owner_clause(owner_id),
         )
         .limit(1)
         .options(noload(AssetInfo.tags))
@@ -291,17 +255,6 @@ def fetch_asset_info_and_asset(
     if not pair:
         return None
     return pair[0], pair[1]
-
-def list_cache_states_by_asset_id(
-    session: Session, *, asset_id: str
-) -> Sequence[AssetCacheState]:
-    return (
-        session.execute(
-            select(AssetCacheState)
-            .where(AssetCacheState.asset_id == asset_id)
-            .order_by(AssetCacheState.id.asc())
-        )
-    ).scalars().all()
 
 
 def touch_asset_info_by_id(
@@ -366,7 +319,6 @@ def create_asset_info_for_existing_asset(
             raise RuntimeError("AssetInfo upsert failed to find existing row after conflict.")
         return existing
 
-    # metadata["filename"] hack
     new_meta = dict(user_metadata or {})
     computed_filename = None
     try:
@@ -392,42 +344,6 @@ def create_asset_info_for_existing_asset(
             origin=tag_origin,
         )
     return info
-
-
-def set_asset_info_tags(
-    session: Session,
-    *,
-    asset_info_id: str,
-    tags: Sequence[str],
-    origin: str = "manual",
-) -> dict:
-    desired = normalize_tags(tags)
-
-    current = set(
-        tag_name for (tag_name,) in (
-            session.execute(select(AssetInfoTag.tag_name).where(AssetInfoTag.asset_info_id == asset_info_id))
-        ).all()
-    )
-
-    to_add = [t for t in desired if t not in current]
-    to_remove = [t for t in current if t not in desired]
-
-    if to_add:
-        ensure_tags_exist(session, to_add, tag_type="user")
-        session.add_all([
-            AssetInfoTag(asset_info_id=asset_info_id, tag_name=t, origin=origin, added_at=utcnow())
-            for t in to_add
-        ])
-        session.flush()
-
-    if to_remove:
-        session.execute(
-            delete(AssetInfoTag)
-            .where(AssetInfoTag.asset_info_id == asset_info_id, AssetInfoTag.tag_name.in_(to_remove))
-        )
-        session.flush()
-
-    return {"added": to_add, "removed": to_remove, "total": desired}
 
 
 def replace_asset_info_metadata_projection(
@@ -507,7 +423,6 @@ def ingest_fs_asset(
         "asset_info_id": None,
     }
 
-    # 1) Asset by hash
     asset = (
         session.execute(select(Asset).where(Asset.hash == asset_hash).limit(1))
     ).scalars().first()
@@ -543,7 +458,6 @@ def ingest_fs_asset(
         if changed:
             out["asset_updated"] = True
 
-    # 2) AssetCacheState upsert by file_path (unique)
     vals = {
         "asset_id": asset.id,
         "file_path": locator,
@@ -575,7 +489,6 @@ def ingest_fs_asset(
         if int(res2.rowcount or 0) > 0:
             out["state_updated"] = True
 
-    # 3) Optional AssetInfo + tags + metadata
     if info_name:
         try:
             with session.begin_nested():
@@ -652,7 +565,6 @@ def ingest_fs_asset(
                 )
                 session.flush()
 
-        # metadata["filename"] hack
         if out["asset_info_id"] is not None:
             primary_path = pick_best_live_path(list_cache_states_by_asset_id(session, asset_id=asset.id))
             computed_filename = compute_relative_filename(primary_path) if primary_path else None
@@ -752,205 +664,9 @@ def delete_asset_info_by_id(
 ) -> bool:
     stmt = sa.delete(AssetInfo).where(
         AssetInfo.id == asset_info_id,
-        visible_owner_clause(owner_id),
+        _visible_owner_clause(owner_id),
     )
     return int((session.execute(stmt)).rowcount or 0) > 0
-
-
-def list_tags_with_usage(
-    session: Session,
-    prefix: str | None = None,
-    limit: int = 100,
-    offset: int = 0,
-    include_zero: bool = True,
-    order: str = "count_desc",
-    owner_id: str = "",
-) -> tuple[list[tuple[str, str, int]], int]:
-    counts_sq = (
-        select(
-            AssetInfoTag.tag_name.label("tag_name"),
-            func.count(AssetInfoTag.asset_info_id).label("cnt"),
-        )
-        .select_from(AssetInfoTag)
-        .join(AssetInfo, AssetInfo.id == AssetInfoTag.asset_info_id)
-        .where(visible_owner_clause(owner_id))
-        .group_by(AssetInfoTag.tag_name)
-        .subquery()
-    )
-
-    q = (
-        select(
-            Tag.name,
-            Tag.tag_type,
-            func.coalesce(counts_sq.c.cnt, 0).label("count"),
-        )
-        .select_from(Tag)
-        .join(counts_sq, counts_sq.c.tag_name == Tag.name, isouter=True)
-    )
-
-    if prefix:
-        escaped, esc = escape_like_prefix(prefix.strip().lower())
-        q = q.where(Tag.name.like(escaped + "%", escape=esc))
-
-    if not include_zero:
-        q = q.where(func.coalesce(counts_sq.c.cnt, 0) > 0)
-
-    if order == "name_asc":
-        q = q.order_by(Tag.name.asc())
-    else:
-        q = q.order_by(func.coalesce(counts_sq.c.cnt, 0).desc(), Tag.name.asc())
-
-    total_q = select(func.count()).select_from(Tag)
-    if prefix:
-        escaped, esc = escape_like_prefix(prefix.strip().lower())
-        total_q = total_q.where(Tag.name.like(escaped + "%", escape=esc))
-    if not include_zero:
-        total_q = total_q.where(
-            Tag.name.in_(select(AssetInfoTag.tag_name).group_by(AssetInfoTag.tag_name))
-        )
-
-    rows = (session.execute(q.limit(limit).offset(offset))).all()
-    total = (session.execute(total_q)).scalar_one()
-
-    rows_norm = [(name, ttype, int(count or 0)) for (name, ttype, count) in rows]
-    return rows_norm, int(total or 0)
-
-
-def ensure_tags_exist(session: Session, names: Iterable[str], tag_type: str = "user") -> None:
-    wanted = normalize_tags(list(names))
-    if not wanted:
-        return
-    rows = [{"name": n, "tag_type": tag_type} for n in list(dict.fromkeys(wanted))]
-    ins = (
-        sqlite.insert(Tag)
-        .values(rows)
-        .on_conflict_do_nothing(index_elements=[Tag.name])
-    )
-    session.execute(ins)
-
-
-def get_asset_tags(session: Session, *, asset_info_id: str) -> list[str]:
-    return [
-        tag_name for (tag_name,) in (
-            session.execute(
-                select(AssetInfoTag.tag_name).where(AssetInfoTag.asset_info_id == asset_info_id)
-            )
-        ).all()
-    ]
-
-
-def add_tags_to_asset_info(
-    session: Session,
-    *,
-    asset_info_id: str,
-    tags: Sequence[str],
-    origin: str = "manual",
-    create_if_missing: bool = True,
-    asset_info_row: Any = None,
-) -> dict:
-    if not asset_info_row:
-        info = session.get(AssetInfo, asset_info_id)
-        if not info:
-            raise ValueError(f"AssetInfo {asset_info_id} not found")
-
-    norm = normalize_tags(tags)
-    if not norm:
-        total = get_asset_tags(session, asset_info_id=asset_info_id)
-        return {"added": [], "already_present": [], "total_tags": total}
-
-    if create_if_missing:
-        ensure_tags_exist(session, norm, tag_type="user")
-
-    current = {
-        tag_name
-        for (tag_name,) in (
-            session.execute(
-                sa.select(AssetInfoTag.tag_name).where(AssetInfoTag.asset_info_id == asset_info_id)
-            )
-        ).all()
-    }
-
-    want = set(norm)
-    to_add = sorted(want - current)
-
-    if to_add:
-        with session.begin_nested() as nested:
-            try:
-                session.add_all(
-                    [
-                        AssetInfoTag(
-                            asset_info_id=asset_info_id,
-                            tag_name=t,
-                            origin=origin,
-                            added_at=utcnow(),
-                        )
-                        for t in to_add
-                    ]
-                )
-                session.flush()
-            except IntegrityError:
-                nested.rollback()
-
-    after = set(get_asset_tags(session, asset_info_id=asset_info_id))
-    return {
-        "added": sorted(((after - current) & want)),
-        "already_present": sorted(want & current),
-        "total_tags": sorted(after),
-    }
-
-
-def remove_tags_from_asset_info(
-    session: Session,
-    *,
-    asset_info_id: str,
-    tags: Sequence[str],
-) -> dict:
-    info = session.get(AssetInfo, asset_info_id)
-    if not info:
-        raise ValueError(f"AssetInfo {asset_info_id} not found")
-
-    norm = normalize_tags(tags)
-    if not norm:
-        total = get_asset_tags(session, asset_info_id=asset_info_id)
-        return {"removed": [], "not_present": [], "total_tags": total}
-
-    existing = {
-        tag_name
-        for (tag_name,) in (
-            session.execute(
-                sa.select(AssetInfoTag.tag_name).where(AssetInfoTag.asset_info_id == asset_info_id)
-            )
-        ).all()
-    }
-
-    to_remove = sorted(set(t for t in norm if t in existing))
-    not_present = sorted(set(t for t in norm if t not in existing))
-
-    if to_remove:
-        session.execute(
-            delete(AssetInfoTag)
-            .where(
-                AssetInfoTag.asset_info_id == asset_info_id,
-                AssetInfoTag.tag_name.in_(to_remove),
-            )
-        )
-        session.flush()
-
-    total = get_asset_tags(session, asset_info_id=asset_info_id)
-    return {"removed": to_remove, "not_present": not_present, "total_tags": total}
-
-
-def remove_missing_tag_for_asset_id(
-    session: Session,
-    *,
-    asset_id: str,
-) -> None:
-    session.execute(
-        sa.delete(AssetInfoTag).where(
-            AssetInfoTag.asset_info_id.in_(sa.select(AssetInfo.id).where(AssetInfo.asset_id == asset_id)),
-            AssetInfoTag.tag_name == "missing",
-        )
-    )
 
 
 def set_asset_info_preview(
@@ -967,7 +683,6 @@ def set_asset_info_preview(
     if preview_asset_id is None:
         info.preview_id = None
     else:
-        # validate preview asset exists
         if not session.get(Asset, preview_asset_id):
             raise ValueError(f"Preview Asset {preview_asset_id} not found")
         info.preview_id = preview_asset_id
