@@ -23,10 +23,16 @@ from app.assets.database.queries.asset_info import (
 )
 
 from app.assets.database.queries.cache_state import (
+    CacheStateRow,
     list_cache_states_by_asset_id,
     upsert_cache_state,
-    prune_orphaned_assets,
-    fast_db_consistency_pass,
+    delete_cache_states_outside_prefixes,
+    get_orphaned_seed_asset_ids,
+    delete_assets_by_ids,
+    get_cache_states_for_prefixes,
+    bulk_set_needs_verify,
+    delete_cache_states_by_ids,
+    delete_orphaned_seed_asset,
 )
 
 from app.assets.database.queries.tags import (
@@ -59,10 +65,16 @@ __all__ = [
     "delete_asset_info_by_id",
     "set_asset_info_preview",
     # cache_state.py
+    "CacheStateRow",
     "list_cache_states_by_asset_id",
     "upsert_cache_state",
-    "prune_orphaned_assets",
-    "fast_db_consistency_pass",
+    "delete_cache_states_outside_prefixes",
+    "get_orphaned_seed_asset_ids",
+    "delete_assets_by_ids",
+    "get_cache_states_for_prefixes",
+    "bulk_set_needs_verify",
+    "delete_cache_states_by_ids",
+    "delete_orphaned_seed_asset",
     # tags.py
     "ensure_tags_exist",
     "get_asset_tags",

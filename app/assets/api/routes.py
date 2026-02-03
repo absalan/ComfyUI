@@ -11,7 +11,7 @@ import app.assets.manager as manager
 from app import user_manager
 from app.assets.api import schemas_in
 from app.assets.helpers import get_query_dict
-from app.assets.scanner import seed_assets
+from app.assets.services.scanner import seed_assets
 
 import folder_paths
 

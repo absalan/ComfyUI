@@ -1,6 +1,5 @@
-import contextlib
 import os
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import sqlalchemy as sa
 from sqlalchemy import select
@@ -9,6 +8,31 @@ from sqlalchemy.orm import Session
 
 from app.assets.database.models import Asset, AssetCacheState, AssetInfo
 from app.assets.helpers import escape_like_prefix
+
+__all__ = [
+    "CacheStateRow",
+    "list_cache_states_by_asset_id",
+    "upsert_cache_state",
+    "delete_cache_states_outside_prefixes",
+    "get_orphaned_seed_asset_ids",
+    "delete_assets_by_ids",
+    "get_cache_states_for_prefixes",
+    "bulk_set_needs_verify",
+    "delete_cache_states_by_ids",
+    "delete_orphaned_seed_asset",
+]
+
+
+class CacheStateRow(NamedTuple):
+    """Row from cache state query with joined asset data."""
+
+    state_id: int
+    file_path: str
+    mtime_ns: int | None
+    needs_verify: bool
+    asset_id: str
+    asset_hash: str | None
+    size_bytes: int
 
 
 def list_cache_states_by_asset_id(
@@ -63,19 +87,17 @@ def upsert_cache_state(
     return False, updated
 
 
-def prune_orphaned_assets(session: Session, roots: tuple[str, ...], prefixes_for_root_fn) -> int:
-    """Prune cache states outside configured prefixes, then delete orphaned seed assets.
+def delete_cache_states_outside_prefixes(session: Session, valid_prefixes: list[str]) -> int:
+    """Delete cache states with file_path not matching any of the valid prefixes.
 
     Args:
         session: Database session
-        roots: Tuple of root types to prune
-        prefixes_for_root_fn: Function to get prefixes for a root type
+        valid_prefixes: List of absolute directory prefixes that are valid
 
     Returns:
-        Number of orphaned assets deleted
+        Number of cache states deleted
     """
-    all_prefixes = [os.path.abspath(p) for r in roots for p in prefixes_for_root_fn(r)]
-    if not all_prefixes:
+    if not valid_prefixes:
         return 0
 
     def make_prefix_condition(prefix: str):
@@ -83,153 +105,131 @@ def prune_orphaned_assets(session: Session, roots: tuple[str, ...], prefixes_for
         escaped, esc = escape_like_prefix(base)
         return AssetCacheState.file_path.like(escaped + "%", escape=esc)
 
-    matches_valid_prefix = sa.or_(*[make_prefix_condition(p) for p in all_prefixes])
+    matches_valid_prefix = sa.or_(*[make_prefix_condition(p) for p in valid_prefixes])
+    result = session.execute(sa.delete(AssetCacheState).where(~matches_valid_prefix))
+    return result.rowcount
 
+
+def get_orphaned_seed_asset_ids(session: Session) -> list[str]:
+    """Get IDs of seed assets (hash is None) with no remaining cache states.
+
+    Returns:
+        List of asset IDs that are orphaned
+    """
     orphan_subq = (
         sa.select(Asset.id)
         .outerjoin(AssetCacheState, AssetCacheState.asset_id == Asset.id)
         .where(Asset.hash.is_(None), AssetCacheState.id.is_(None))
-    ).scalar_subquery()
+    )
+    return [row[0] for row in session.execute(orphan_subq).all()]
 
-    session.execute(sa.delete(AssetCacheState).where(~matches_valid_prefix))
-    session.execute(sa.delete(AssetInfo).where(AssetInfo.asset_id.in_(orphan_subq)))
-    result = session.execute(sa.delete(Asset).where(Asset.id.in_(orphan_subq)))
+
+def delete_assets_by_ids(session: Session, asset_ids: list[str]) -> int:
+    """Delete assets and their AssetInfos by ID.
+
+    Args:
+        session: Database session
+        asset_ids: List of asset IDs to delete
+
+    Returns:
+        Number of assets deleted
+    """
+    if not asset_ids:
+        return 0
+    session.execute(sa.delete(AssetInfo).where(AssetInfo.asset_id.in_(asset_ids)))
+    result = session.execute(sa.delete(Asset).where(Asset.id.in_(asset_ids)))
     return result.rowcount
 
 
-def fast_db_consistency_pass(
+def get_cache_states_for_prefixes(
     session: Session,
-    root: str,
-    prefixes_for_root_fn,
-    escape_like_prefix_fn,
-    fast_asset_file_check_fn,
-    add_missing_tag_fn,
-    remove_missing_tag_fn,
-    collect_existing_paths: bool = False,
-    update_missing_tags: bool = False,
-) -> set[str] | None:
-    """Fast DB+FS pass for a root:
-      - Toggle needs_verify per state using fast check
-      - For hashed assets with at least one fast-ok state in this root: delete stale missing states
-      - For seed assets with all states missing: delete Asset and its AssetInfos
-      - Optionally add/remove 'missing' tags based on fast-ok in this root
-      - Optionally return surviving absolute paths
+    prefixes: list[str],
+) -> list[CacheStateRow]:
+    """Get all cache states with paths matching any of the given prefixes.
+
+    Args:
+        session: Database session
+        prefixes: List of absolute directory prefixes to match
+
+    Returns:
+        List of cache state rows with joined asset data, ordered by asset_id, state_id
     """
-    prefixes = prefixes_for_root_fn(root)
     if not prefixes:
-        return set() if collect_existing_paths else None
+        return []
 
     conds = []
     for p in prefixes:
         base = os.path.abspath(p)
         if not base.endswith(os.sep):
             base += os.sep
-        escaped, esc = escape_like_prefix_fn(base)
+        escaped, esc = escape_like_prefix(base)
         conds.append(AssetCacheState.file_path.like(escaped + "%", escape=esc))
 
-    rows = (
-        session.execute(
-            sa.select(
-                AssetCacheState.id,
-                AssetCacheState.file_path,
-                AssetCacheState.mtime_ns,
-                AssetCacheState.needs_verify,
-                AssetCacheState.asset_id,
-                Asset.hash,
-                Asset.size_bytes,
-            )
-            .join(Asset, Asset.id == AssetCacheState.asset_id)
-            .where(sa.or_(*conds))
-            .order_by(AssetCacheState.asset_id.asc(), AssetCacheState.id.asc())
+    rows = session.execute(
+        sa.select(
+            AssetCacheState.id,
+            AssetCacheState.file_path,
+            AssetCacheState.mtime_ns,
+            AssetCacheState.needs_verify,
+            AssetCacheState.asset_id,
+            Asset.hash,
+            Asset.size_bytes,
         )
+        .join(Asset, Asset.id == AssetCacheState.asset_id)
+        .where(sa.or_(*conds))
+        .order_by(AssetCacheState.asset_id.asc(), AssetCacheState.id.asc())
     ).all()
 
-    by_asset: dict[str, dict] = {}
-    for sid, fp, mtime_db, needs_verify, aid, a_hash, a_size in rows:
-        acc = by_asset.get(aid)
-        if acc is None:
-            acc = {"hash": a_hash, "size_db": int(a_size or 0), "states": []}
-            by_asset[aid] = acc
-
-        fast_ok = False
-        try:
-            exists = True
-            fast_ok = fast_asset_file_check_fn(
-                mtime_db=mtime_db,
-                size_db=acc["size_db"],
-                stat_result=os.stat(fp, follow_symlinks=True),
-            )
-        except FileNotFoundError:
-            exists = False
-        except OSError:
-            exists = False
-
-        acc["states"].append({
-            "sid": sid,
-            "fp": fp,
-            "exists": exists,
-            "fast_ok": fast_ok,
-            "needs_verify": bool(needs_verify),
-        })
-
-    to_set_verify: list[int] = []
-    to_clear_verify: list[int] = []
-    stale_state_ids: list[int] = []
-    survivors: set[str] = set()
-
-    for aid, acc in by_asset.items():
-        a_hash = acc["hash"]
-        states = acc["states"]
-        any_fast_ok = any(s["fast_ok"] for s in states)
-        all_missing = all(not s["exists"] for s in states)
-
-        for s in states:
-            if not s["exists"]:
-                continue
-            if s["fast_ok"] and s["needs_verify"]:
-                to_clear_verify.append(s["sid"])
-            if not s["fast_ok"] and not s["needs_verify"]:
-                to_set_verify.append(s["sid"])
-
-        if a_hash is None:
-            if states and all_missing:
-                session.execute(sa.delete(AssetInfo).where(AssetInfo.asset_id == aid))
-                asset = session.get(Asset, aid)
-                if asset:
-                    session.delete(asset)
-            else:
-                for s in states:
-                    if s["exists"]:
-                        survivors.add(os.path.abspath(s["fp"]))
-            continue
-
-        if any_fast_ok:
-            for s in states:
-                if not s["exists"]:
-                    stale_state_ids.append(s["sid"])
-            if update_missing_tags:
-                with contextlib.suppress(Exception):
-                    remove_missing_tag_fn(session, asset_id=aid)
-        elif update_missing_tags:
-            with contextlib.suppress(Exception):
-                add_missing_tag_fn(session, asset_id=aid, origin="automatic")
-
-        for s in states:
-            if s["exists"]:
-                survivors.add(os.path.abspath(s["fp"]))
-
-    if stale_state_ids:
-        session.execute(sa.delete(AssetCacheState).where(AssetCacheState.id.in_(stale_state_ids)))
-    if to_set_verify:
-        session.execute(
-            sa.update(AssetCacheState)
-            .where(AssetCacheState.id.in_(to_set_verify))
-            .values(needs_verify=True)
+    return [
+        CacheStateRow(
+            state_id=row[0],
+            file_path=row[1],
+            mtime_ns=row[2],
+            needs_verify=row[3],
+            asset_id=row[4],
+            asset_hash=row[5],
+            size_bytes=int(row[6] or 0),
         )
-    if to_clear_verify:
-        session.execute(
-            sa.update(AssetCacheState)
-            .where(AssetCacheState.id.in_(to_clear_verify))
-            .values(needs_verify=False)
-        )
-    return survivors if collect_existing_paths else None
+        for row in rows
+    ]
+
+
+def bulk_set_needs_verify(session: Session, state_ids: list[int], value: bool) -> int:
+    """Set needs_verify flag for multiple cache states.
+
+    Returns: Number of rows updated
+    """
+    if not state_ids:
+        return 0
+    result = session.execute(
+        sa.update(AssetCacheState)
+        .where(AssetCacheState.id.in_(state_ids))
+        .values(needs_verify=value)
+    )
+    return result.rowcount
+
+
+def delete_cache_states_by_ids(session: Session, state_ids: list[int]) -> int:
+    """Delete cache states by their IDs.
+
+    Returns: Number of rows deleted
+    """
+    if not state_ids:
+        return 0
+    result = session.execute(
+        sa.delete(AssetCacheState).where(AssetCacheState.id.in_(state_ids))
+    )
+    return result.rowcount
+
+
+def delete_orphaned_seed_asset(session: Session, asset_id: str) -> bool:
+    """Delete a seed asset (hash is None) and its AssetInfos.
+
+    Returns: True if asset was deleted, False if not found
+    """
+    session.execute(sa.delete(AssetInfo).where(AssetInfo.asset_id == asset_id))
+    asset = session.get(Asset, asset_id)
+    if asset:
+        session.delete(asset)
+        return True
+    return False
