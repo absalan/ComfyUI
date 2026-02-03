@@ -1,10 +1,23 @@
-from blake3 import blake3
 from typing import IO
 import os
 import asyncio
 
+try:
+    from blake3 import blake3
+except ImportError:
+    blake3 = None  # type: ignore[misc, assignment]
+
 
 DEFAULT_CHUNK = 8 * 1024 *1024 # 8MB
+
+
+def _require_blake3() -> None:
+    """Raise ImportError with helpful message if blake3 is not installed."""
+    if blake3 is None:
+        raise ImportError(
+            "blake3 is required for asset hashing but is not installed. "
+            "Install it with: pip install blake3"
+        )
 
 # NOTE: this allows hashing different representations of a file-like object
 def compute_blake3_hash(
@@ -51,6 +64,8 @@ def _hash_file_obj(file_obj: IO, chunk_size: int = DEFAULT_CHUNK) -> str:
     - Seeks to the beginning before reading (if supported).
     - Restores the original position afterward (if tell/seek are supported).
     """
+    _require_blake3()
+
     if chunk_size <= 0:
         chunk_size = DEFAULT_CHUNK
 
