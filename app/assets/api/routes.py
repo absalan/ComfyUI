@@ -10,6 +10,13 @@ from pydantic import ValidationError
 import app.assets.manager as manager
 from app import user_manager
 from app.assets.api import schemas_in
+from app.assets.api.schemas_in import (
+    AssetNotFoundError,
+    AssetValidationError,
+    HashMismatchError,
+    UploadError,
+)
+from app.assets.api.upload import parse_multipart_upload
 from app.assets.services.scanner import seed_assets
 from typing import Any
 
@@ -185,182 +192,27 @@ async def create_asset_from_hash(request: web.Request) -> web.Response:
 @ROUTES.post("/api/assets")
 async def upload_asset(request: web.Request) -> web.Response:
     """Multipart/form-data endpoint for Asset uploads."""
-    if not (request.content_type or "").lower().startswith("multipart/"):
-        return _error_response(415, "UNSUPPORTED_MEDIA_TYPE", "Use multipart/form-data for uploads.")
-
-    reader = await request.multipart()
-
-    file_present = False
-    file_client_name: str | None = None
-    tags_raw: list[str] = []
-    provided_name: str | None = None
-    user_metadata_raw: str | None = None
-    provided_hash: str | None = None
-    provided_hash_exists: bool | None = None
-
-    file_written = 0
-    tmp_path: str | None = None
-    while True:
-        field = await reader.next()
-        if field is None:
-            break
-
-        fname = getattr(field, "name", "") or ""
-
-        if fname == "hash":
-            try:
-                s = ((await field.text()) or "").strip().lower()
-            except Exception:
-                return _error_response(400, "INVALID_HASH", "hash must be like 'blake3:<hex>'")
-
-            if s:
-                if ":" not in s:
-                    return _error_response(400, "INVALID_HASH", "hash must be like 'blake3:<hex>'")
-                algo, digest = s.split(":", 1)
-                if algo != "blake3" or not digest or any(c for c in digest if c not in "0123456789abcdef"):
-                    return _error_response(400, "INVALID_HASH", "hash must be like 'blake3:<hex>'")
-                provided_hash = f"{algo}:{digest}"
-                try:
-                    provided_hash_exists = manager.asset_exists(asset_hash=provided_hash)
-                except Exception:
-                    provided_hash_exists = None  # do not fail the whole request here
-
-        elif fname == "file":
-            file_present = True
-            file_client_name = (field.filename or "").strip()
-
-            if provided_hash and provided_hash_exists is True:
-                # If client supplied a hash that we know exists, drain but do not write to disk
-                try:
-                    while True:
-                        chunk = await field.read_chunk(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        file_written += len(chunk)
-                except Exception:
-                    return _error_response(500, "UPLOAD_IO_ERROR", "Failed to receive uploaded file.")
-                continue  # Do not create temp file; we will create AssetInfo from the existing content
-
-            # Otherwise, store to temp for hashing/ingest
-            uploads_root = os.path.join(folder_paths.get_temp_directory(), "uploads")
-            unique_dir = os.path.join(uploads_root, uuid.uuid4().hex)
-            os.makedirs(unique_dir, exist_ok=True)
-            tmp_path = os.path.join(unique_dir, ".upload.part")
-
-            try:
-                with open(tmp_path, "wb") as f:
-                    while True:
-                        chunk = await field.read_chunk(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        file_written += len(chunk)
-            except Exception:
-                try:
-                    if os.path.exists(tmp_path or ""):
-                        os.remove(tmp_path)
-                finally:
-                    return _error_response(500, "UPLOAD_IO_ERROR", "Failed to receive and store uploaded file.")
-        elif fname == "tags":
-            tags_raw.append((await field.text()) or "")
-        elif fname == "name":
-            provided_name = (await field.text()) or None
-        elif fname == "user_metadata":
-            user_metadata_raw = (await field.text()) or None
-
-    # If client did not send file, and we are not doing a from-hash fast path -> error
-    if not file_present and not (provided_hash and provided_hash_exists):
-        return _error_response(400, "MISSING_FILE", "Form must include a 'file' part or a known 'hash'.")
-
-    if file_present and file_written == 0 and not (provided_hash and provided_hash_exists):
-        # Empty upload is only acceptable if we are fast-pathing from existing hash
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        finally:
-            return _error_response(400, "EMPTY_UPLOAD", "Uploaded file is empty.")
-
     try:
-        spec = schemas_in.UploadAssetSpec.model_validate({
-            "tags": tags_raw,
-            "name": provided_name,
-            "user_metadata": user_metadata_raw,
-            "hash": provided_hash,
-        })
-    except ValidationError as ve:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        finally:
-            return _validation_error_response("INVALID_BODY", ve)
-
-    # Validate models category against configured folders (consistent with previous behavior)
-    if spec.tags and spec.tags[0] == "models":
-        if len(spec.tags) < 2 or spec.tags[1] not in folder_paths.folder_names_and_paths:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            return _error_response(
-                400, "INVALID_BODY", f"unknown models category '{spec.tags[1] if len(spec.tags) >= 2 else ''}'"
-            )
+        parsed = await parse_multipart_upload(request, check_hash_exists=manager.asset_exists)
+    except UploadError as e:
+        return _error_response(e.status, e.code, e.message)
 
     owner_id = USER_MANAGER.get_request_user_id(request)
 
-    # Fast path: if a valid provided hash exists, create AssetInfo without writing anything
-    if spec.hash and provided_hash_exists is True:
-        try:
-            result = manager.create_asset_from_hash(
-                hash_str=spec.hash,
-                name=spec.name or (spec.hash.split(":", 1)[1]),
-                tags=spec.tags,
-                user_metadata=spec.user_metadata or {},
-                owner_id=owner_id,
-            )
-        except Exception:
-            logging.exception("create_asset_from_hash failed for hash=%s, owner_id=%s", spec.hash, owner_id)
-            return _error_response(500, "INTERNAL", "Unexpected server error.")
-
-        if result is None:
-            return _error_response(404, "ASSET_NOT_FOUND", f"Asset content {spec.hash} does not exist")
-
-        # Drain temp if we accidentally saved (e.g., hash field came after file)
-        if tmp_path and os.path.exists(tmp_path):
-            with contextlib.suppress(Exception):
-                os.remove(tmp_path)
-
-        status = 200 if (not result.created_new) else 201
-        return web.json_response(result.model_dump(mode="json"), status=status)
-
-    # Otherwise, we must have a temp file path to ingest
-    if not tmp_path or not os.path.exists(tmp_path):
-        # The only case we reach here without a temp file is: client sent a hash that does not exist and no file
-        return _error_response(404, "ASSET_NOT_FOUND", "Provided hash not found and no file uploaded.")
-
     try:
-        created = manager.upload_asset_from_temp_path(
-            spec,
-            temp_path=tmp_path,
-            client_filename=file_client_name,
-            owner_id=owner_id,
-            expected_asset_hash=spec.hash,
-        )
-        status = 201 if created.created_new else 200
-        return web.json_response(created.model_dump(mode="json"), status=status)
-    except ValueError as e:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        msg = str(e)
-        if "HASH_MISMATCH" in msg or msg.strip().upper() == "HASH_MISMATCH":
-            return _error_response(
-                400,
-                "HASH_MISMATCH",
-                "Uploaded file hash does not match provided hash.",
-            )
-        return _error_response(400, "BAD_REQUEST", "Invalid inputs.")
+        result = manager.process_upload(parsed=parsed, owner_id=owner_id)
+    except AssetValidationError as e:
+        return _error_response(400, e.code, str(e))
+    except AssetNotFoundError as e:
+        return _error_response(404, "ASSET_NOT_FOUND", str(e))
+    except HashMismatchError as e:
+        return _error_response(400, "HASH_MISMATCH", str(e))
     except Exception:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        logging.exception("upload_asset_from_temp_path failed for tmp_path=%s, owner_id=%s", tmp_path, owner_id)
+        logging.exception("process_upload failed for owner_id=%s", owner_id)
         return _error_response(500, "INTERNAL", "Unexpected server error.")
+
+    status = 201 if result.created_new else 200
+    return web.json_response(result.model_dump(mode="json"), status=status)
 
 
 @ROUTES.put(f"/api/assets/{{id:{UUID_RE}}}")

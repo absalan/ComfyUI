@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import (
@@ -9,6 +10,52 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+
+class UploadError(Exception):
+    """Error during upload parsing with HTTP status and code (used in HTTP layer only)."""
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+class AssetValidationError(Exception):
+    """Validation error in asset processing (invalid tags, metadata, etc.)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class AssetNotFoundError(Exception):
+    """Asset or asset content not found."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class HashMismatchError(Exception):
+    """Uploaded file hash does not match provided hash."""
+
+    pass
+
+
+@dataclass
+class ParsedUpload:
+    """Result of parsing a multipart upload request."""
+
+    file_present: bool
+    file_written: int
+    file_client_name: str | None
+    tmp_path: str | None
+    tags_raw: list[str]
+    provided_name: str | None
+    user_metadata_raw: str | None
+    provided_hash: str | None
+    provided_hash_exists: bool | None
 
 class ListAssetsQuery(BaseModel):
     include_tags: list[str] = Field(default_factory=list)
