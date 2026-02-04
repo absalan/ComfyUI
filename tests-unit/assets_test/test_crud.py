@@ -126,42 +126,52 @@ def test_head_asset_bad_hash_returns_400_and_no_body(http: requests.Session, api
     assert body == b""
 
 
-def test_delete_nonexistent_returns_404(http: requests.Session, api_base: str):
-    bogus = str(uuid.uuid4())
-    r = http.delete(f"{api_base}/api/assets/{bogus}", timeout=120)
+@pytest.mark.parametrize(
+    "method,endpoint_template,payload,expected_status,error_code",
+    [
+        # Delete nonexistent asset
+        ("delete", "/api/assets/{uuid}", None, 404, "ASSET_NOT_FOUND"),
+        # Bad hash algorithm in from-hash
+        (
+            "post",
+            "/api/assets/from-hash",
+            {"hash": "sha256:" + "0" * 64, "name": "x.bin", "tags": ["models", "checkpoints", "unit-tests"]},
+            400,
+            "INVALID_BODY",
+        ),
+        # Get with bad UUID format
+        ("get", "/api/assets/not-a-uuid", None, 404, None),
+        # Get content with bad UUID format
+        ("get", "/api/assets/not-a-uuid/content", None, 404, None),
+    ],
+    ids=["delete_nonexistent", "bad_hash_algorithm", "get_bad_uuid", "content_bad_uuid"],
+)
+def test_error_responses(
+    http: requests.Session, api_base: str, method, endpoint_template, payload, expected_status, error_code
+):
+    # Replace {uuid} placeholder with a random UUID for delete test
+    endpoint = endpoint_template.replace("{uuid}", str(uuid.uuid4()))
+    url = f"{api_base}{endpoint}"
+
+    if method == "get":
+        r = http.get(url, timeout=120)
+    elif method == "post":
+        r = http.post(url, json=payload, timeout=120)
+    elif method == "delete":
+        r = http.delete(url, timeout=120)
+
+    assert r.status_code == expected_status
+    if error_code:
+        body = r.json()
+        assert body["error"]["code"] == error_code
+
+
+def test_create_from_hash_invalid_json(http: requests.Session, api_base: str):
+    """Invalid JSON body requires special handling (data= instead of json=)."""
+    r = http.post(f"{api_base}/api/assets/from-hash", data=b"{not json}", timeout=120)
     body = r.json()
-    assert r.status_code == 404
-    assert body["error"]["code"] == "ASSET_NOT_FOUND"
-
-
-def test_create_from_hash_invalids(http: requests.Session, api_base: str):
-    # Bad hash algorithm
-    bad = {
-        "hash": "sha256:" + "0" * 64,
-        "name": "x.bin",
-        "tags": ["models", "checkpoints", "unit-tests"],
-    }
-    r1 = http.post(f"{api_base}/api/assets/from-hash", json=bad, timeout=120)
-    b1 = r1.json()
-    assert r1.status_code == 400
-    assert b1["error"]["code"] == "INVALID_BODY"
-
-    # Invalid JSON body
-    r2 = http.post(f"{api_base}/api/assets/from-hash", data=b"{not json}", timeout=120)
-    b2 = r2.json()
-    assert r2.status_code == 400
-    assert b2["error"]["code"] == "INVALID_JSON"
-
-
-def test_get_update_download_bad_ids(http: requests.Session, api_base: str):
-    # All endpoints should be not found, as we UUID regex directly in the route definition.
-    bad_id = "not-a-uuid"
-
-    r1 = http.get(f"{api_base}/api/assets/{bad_id}", timeout=120)
-    assert r1.status_code == 404
-
-    r3 = http.get(f"{api_base}/api/assets/{bad_id}/content", timeout=120)
-    assert r3.status_code == 404
+    assert r.status_code == 400
+    assert body["error"]["code"] == "INVALID_JSON"
 
 
 def test_update_requires_at_least_one_field(http: requests.Session, api_base: str, seeded_asset: dict):

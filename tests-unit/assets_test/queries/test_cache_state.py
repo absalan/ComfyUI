@@ -1,4 +1,5 @@
 """Tests for cache_state query functions."""
+import pytest
 from sqlalchemy.orm import Session
 
 from app.assets.database.models import Asset, AssetCacheState, AssetInfo
@@ -133,46 +134,39 @@ class TestSelectBestLivePathWithMocking:
 
 
 class TestUpsertCacheState:
-    def test_creates_new_state(self, session: Session):
+    @pytest.mark.parametrize(
+        "initial_mtime,second_mtime,expect_created,expect_updated,final_mtime",
+        [
+            # New state creation
+            (None, 12345, True, False, 12345),
+            # Existing state, same mtime - no update
+            (100, 100, False, False, 100),
+            # Existing state, different mtime - update
+            (100, 200, False, True, 200),
+        ],
+        ids=["new_state", "existing_no_change", "existing_update_mtime"],
+    )
+    def test_upsert_scenarios(
+        self, session: Session, initial_mtime, second_mtime, expect_created, expect_updated, final_mtime
+    ):
         asset = _make_asset(session, "hash1")
+        file_path = f"/path_{initial_mtime}_{second_mtime}.bin"
+
+        # Create initial state if needed
+        if initial_mtime is not None:
+            upsert_cache_state(session, asset_id=asset.id, file_path=file_path, mtime_ns=initial_mtime)
+            session.commit()
+
+        # The upsert call we're testing
         created, updated = upsert_cache_state(
-            session, asset_id=asset.id, file_path="/new/path.bin", mtime_ns=12345
+            session, asset_id=asset.id, file_path=file_path, mtime_ns=second_mtime
         )
         session.commit()
 
-        assert created is True
-        assert updated is False
-        state = session.query(AssetCacheState).filter_by(file_path="/new/path.bin").one()
-        assert state.asset_id == asset.id
-        assert state.mtime_ns == 12345
-
-    def test_returns_existing_without_update(self, session: Session):
-        asset = _make_asset(session, "hash1")
-        upsert_cache_state(session, asset_id=asset.id, file_path="/existing.bin", mtime_ns=100)
-        session.commit()
-
-        created, updated = upsert_cache_state(
-            session, asset_id=asset.id, file_path="/existing.bin", mtime_ns=100
-        )
-        session.commit()
-
-        assert created is False
-        assert updated is False
-
-    def test_updates_existing_with_new_mtime(self, session: Session):
-        asset = _make_asset(session, "hash1")
-        upsert_cache_state(session, asset_id=asset.id, file_path="/update.bin", mtime_ns=100)
-        session.commit()
-
-        created, updated = upsert_cache_state(
-            session, asset_id=asset.id, file_path="/update.bin", mtime_ns=200
-        )
-        session.commit()
-
-        assert created is False
-        assert updated is True
-        state = session.query(AssetCacheState).filter_by(file_path="/update.bin").one()
-        assert state.mtime_ns == 200
+        assert created is expect_created
+        assert updated is expect_updated
+        state = session.query(AssetCacheState).filter_by(file_path=file_path).one()
+        assert state.mtime_ns == final_mtime
 
 
 class TestDeleteCacheStatesOutsidePrefixes:
@@ -323,26 +317,35 @@ class TestDeleteCacheStatesByIds:
 
 
 class TestDeleteOrphanedSeedAsset:
-    def test_deletes_seed_asset_and_infos(self, session: Session):
-        asset = _make_asset(session, hash_val=None)
-        now = get_utc_now()
-        info = AssetInfo(
-            owner_id="", name="test", asset_id=asset.id,
-            created_at=now, updated_at=now, last_access_time=now
-        )
-        session.add(info)
-        session.commit()
+    @pytest.mark.parametrize(
+        "create_asset,expected_deleted,expected_count",
+        [
+            (True, True, 0),   # Existing asset gets deleted
+            (False, False, 0),  # Nonexistent returns False
+        ],
+        ids=["deletes_existing", "nonexistent_returns_false"],
+    )
+    def test_delete_orphaned_seed_asset(
+        self, session: Session, create_asset, expected_deleted, expected_count
+    ):
+        asset_id = "nonexistent-id"
+        if create_asset:
+            asset = _make_asset(session, hash_val=None)
+            asset_id = asset.id
+            now = get_utc_now()
+            info = AssetInfo(
+                owner_id="", name="test", asset_id=asset.id,
+                created_at=now, updated_at=now, last_access_time=now
+            )
+            session.add(info)
+            session.commit()
 
-        deleted = delete_orphaned_seed_asset(session, asset.id)
-        session.commit()
+        deleted = delete_orphaned_seed_asset(session, asset_id)
+        if create_asset:
+            session.commit()
 
-        assert deleted is True
-        assert session.query(Asset).count() == 0
-        assert session.query(AssetInfo).count() == 0
-
-    def test_returns_false_for_nonexistent(self, session: Session):
-        deleted = delete_orphaned_seed_asset(session, "nonexistent-id")
-        assert deleted is False
+        assert deleted is expected_deleted
+        assert session.query(Asset).count() == expected_count
 
 
 class TestBulkInsertCacheStatesIgnoreConflicts:

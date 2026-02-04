@@ -1,4 +1,5 @@
 """Tests for metadata filtering logic in asset_info queries."""
+import pytest
 from sqlalchemy.orm import Session
 
 from app.assets.database.models import Asset, AssetInfo, AssetInfoMeta
@@ -51,94 +52,94 @@ def _make_asset_info(
     return info
 
 
-class TestMetadataFilterString:
-    def test_filter_by_string_value(self, session: Session):
+class TestMetadataFilterByType:
+    """Table-driven tests for metadata filtering by different value types."""
+
+    @pytest.mark.parametrize(
+        "match_meta,nomatch_meta,filter_key,filter_val",
+        [
+            # String matching
+            ({"category": "models"}, {"category": "images"}, "category", "models"),
+            # Integer matching
+            ({"epoch": 5}, {"epoch": 10}, "epoch", 5),
+            # Float matching
+            ({"score": 0.95}, {"score": 0.5}, "score", 0.95),
+            # Boolean True matching
+            ({"enabled": True}, {"enabled": False}, "enabled", True),
+            # Boolean False matching
+            ({"enabled": False}, {"enabled": True}, "enabled", False),
+        ],
+        ids=["string", "int", "float", "bool_true", "bool_false"],
+    )
+    def test_filter_matches_correct_value(
+        self, session: Session, match_meta, nomatch_meta, filter_key, filter_val
+    ):
         asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "match", {"category": "models"})
-        _make_asset_info(session, asset, "nomatch", {"category": "images"})
+        _make_asset_info(session, asset, "match", match_meta)
+        _make_asset_info(session, asset, "nomatch", nomatch_meta)
         session.commit()
 
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"category": "models"})
+        infos, _, total = list_asset_infos_page(
+            session, metadata_filter={filter_key: filter_val}
+        )
         assert total == 1
         assert infos[0].name == "match"
 
-    def test_filter_by_string_no_match(self, session: Session):
+    @pytest.mark.parametrize(
+        "stored_meta,filter_key,filter_val",
+        [
+            # String no match
+            ({"category": "models"}, "category", "other"),
+            # Int no match
+            ({"epoch": 5}, "epoch", 99),
+            # Float no match
+            ({"score": 0.5}, "score", 0.99),
+        ],
+        ids=["string_no_match", "int_no_match", "float_no_match"],
+    )
+    def test_filter_returns_empty_when_no_match(
+        self, session: Session, stored_meta, filter_key, filter_val
+    ):
         asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "item", {"category": "models"})
+        _make_asset_info(session, asset, "item", stored_meta)
         session.commit()
 
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"category": "other"})
+        infos, _, total = list_asset_infos_page(
+            session, metadata_filter={filter_key: filter_val}
+        )
         assert total == 0
 
 
-class TestMetadataFilterNumeric:
-    def test_filter_by_int_value(self, session: Session):
-        asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "epoch5", {"epoch": 5})
-        _make_asset_info(session, asset, "epoch10", {"epoch": 10})
-        session.commit()
-
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"epoch": 5})
-        assert total == 1
-        assert infos[0].name == "epoch5"
-
-    def test_filter_by_float_value(self, session: Session):
-        asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "high", {"score": 0.95})
-        _make_asset_info(session, asset, "low", {"score": 0.5})
-        session.commit()
-
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"score": 0.95})
-        assert total == 1
-        assert infos[0].name == "high"
-
-
-class TestMetadataFilterBoolean:
-    def test_filter_by_true(self, session: Session):
-        asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "active", {"enabled": True})
-        _make_asset_info(session, asset, "inactive", {"enabled": False})
-        session.commit()
-
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"enabled": True})
-        assert total == 1
-        assert infos[0].name == "active"
-
-    def test_filter_by_false(self, session: Session):
-        asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "active", {"enabled": True})
-        _make_asset_info(session, asset, "inactive", {"enabled": False})
-        session.commit()
-
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"enabled": False})
-        assert total == 1
-        assert infos[0].name == "inactive"
-
-
 class TestMetadataFilterNull:
-    def test_filter_by_null_matches_missing_key(self, session: Session):
+    """Tests for null/missing key filtering."""
+
+    @pytest.mark.parametrize(
+        "match_name,match_meta,nomatch_name,nomatch_meta,filter_key",
+        [
+            # Null matches missing key
+            ("missing_key", {}, "has_key", {"optional": "value"}, "optional"),
+            # Null matches explicit null
+            ("explicit_null", {"nullable": None}, "has_value", {"nullable": "present"}, "nullable"),
+        ],
+        ids=["missing_key", "explicit_null"],
+    )
+    def test_null_filter_matches(
+        self, session: Session, match_name, match_meta, nomatch_name, nomatch_meta, filter_key
+    ):
         asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "has_key", {"optional": "value"})
-        _make_asset_info(session, asset, "missing_key", {})
+        _make_asset_info(session, asset, match_name, match_meta)
+        _make_asset_info(session, asset, nomatch_name, nomatch_meta)
         session.commit()
 
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"optional": None})
+        infos, _, total = list_asset_infos_page(session, metadata_filter={filter_key: None})
         assert total == 1
-        assert infos[0].name == "missing_key"
-
-    def test_filter_by_null_matches_explicit_null(self, session: Session):
-        asset = _make_asset(session, "hash1")
-        _make_asset_info(session, asset, "explicit_null", {"nullable": None})
-        _make_asset_info(session, asset, "has_value", {"nullable": "present"})
-        session.commit()
-
-        infos, _, total = list_asset_infos_page(session, metadata_filter={"nullable": None})
-        assert total == 1
-        assert infos[0].name == "explicit_null"
+        assert infos[0].name == match_name
 
 
 class TestMetadataFilterList:
-    def test_filter_by_list_or(self, session: Session):
+    """Tests for list-based (OR) filtering."""
+
+    def test_filter_by_list_matches_any(self, session: Session):
         """List values should match ANY of the values (OR)."""
         asset = _make_asset(session, "hash1")
         _make_asset_info(session, asset, "cat_a", {"category": "a"})
@@ -153,7 +154,9 @@ class TestMetadataFilterList:
 
 
 class TestMetadataFilterMultipleKeys:
-    def test_multiple_keys_and(self, session: Session):
+    """Tests for multiple filter keys (AND semantics)."""
+
+    def test_multiple_keys_must_all_match(self, session: Session):
         """Multiple keys should ALL match (AND)."""
         asset = _make_asset(session, "hash1")
         _make_asset_info(session, asset, "match", {"type": "model", "version": 2})
@@ -169,6 +172,8 @@ class TestMetadataFilterMultipleKeys:
 
 
 class TestMetadataFilterEmptyDict:
+    """Tests for empty filter behavior."""
+
     def test_empty_filter_returns_all(self, session: Session):
         asset = _make_asset(session, "hash1")
         _make_asset_info(session, asset, "a", {"key": "val"})
