@@ -1,25 +1,6 @@
 from __future__ import annotations
 
-import warnings
 from typing import Any
-
-
-def register_node_replacement(node_replace: NodeReplace):
-    """
-    Register node replacement.
-    
-    .. deprecated::
-        Use ``ComfyAPI.node_replacement.register()`` instead.
-        This synchronous function does not work with process isolation (pyisolate).
-    """
-    warnings.warn(
-        "register_node_replacement() is deprecated. "
-        "Use 'await ComfyAPI.node_replacement.register()' instead for pyisolate compatibility.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    from server import PromptServer
-    PromptServer.instance.node_replace_manager.register(node_replace)
 
 
 class NodeReplace:
@@ -42,9 +23,7 @@ class NodeReplace:
         self.output_mapping = output_mapping
 
     def as_dict(self):
-        """
-        Create serializable representation of the node replacement.
-        """
+        """Create serializable representation of the node replacement."""
         return {
             "new_node_id": self.new_node_id,
             "old_node_id": self.old_node_id,
@@ -70,9 +49,7 @@ class InputMap:
             }
 
     class OldId(_Assign):
-        """
-        Connect the input of the old node with given id to new node when replacing.
-        """
+        """Connect the input of the old node with given id to new node when replacing."""
         def __init__(self, old_id: str):
             super().__init__("old_id")
             self.old_id = old_id
@@ -83,9 +60,7 @@ class InputMap:
             }
 
     class SetValue(_Assign):
-        """
-        Use the given value for the input of the new node when replacing; assumes input is a widget.
-        """
+        """Use the given value for the input of the new node when replacing; assumes input is a widget."""
         def __init__(self, value: Any):
             super().__init__("set_value")
             self.value = value
@@ -107,9 +82,7 @@ class InputMap:
 
 
 class OutputMap:
-    """
-    Map outputs of node replacement via indexes, as that's how outputs are stored.
-    """
+    """Map outputs of node replacement via indexes, as that's how outputs are stored."""
     def __init__(self, new_idx: int, old_idx: int):
         self.new_idx = new_idx
         self.old_idx = old_idx
